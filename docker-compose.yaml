@@ -1,0 +1,30 @@
+name: screenshot-service
+
+services:
+  screenshot-service:
+    build: .
+    image: screenshot-service:latest
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${SCREENSHOT_PORT:-5000}:5000"
+    environment:
+      BROWSER_IDLE_TIMEOUT_SECONDS: "${BROWSER_IDLE_TIMEOUT_SECONDS:-300}"
+      MAX_QUEUE_SIZE: "${MAX_QUEUE_SIZE:-100}"
+      NAVIGATION_TIMEOUT_MS: "${NAVIGATION_TIMEOUT_MS:-30000}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=2)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - screenshot_backend
+
+networks:
+  screenshot_backend:
+    name: screenshot_backend
