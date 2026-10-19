@@ -9,10 +9,12 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from io import BytesIO
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
+from PIL import Image
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service
@@ -30,8 +32,13 @@ MAX_DIMENSION = 10000
 MAX_DELAY_MS = 60000
 NAVIGATION_TIMEOUT_MS = int(os.environ.get("NAVIGATION_TIMEOUT_MS", "30000"))
 MAX_NAVIGATION_TIMEOUT_MS = 120000
+REDIRECT_WAIT_MS = int(os.environ.get("REDIRECT_WAIT_MS", "3000"))
+MAX_REDIRECT_WAIT_MS = 60000
 MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "100"))
 BROWSER_IDLE_TIMEOUT_SECONDS = int(os.environ.get("BROWSER_IDLE_TIMEOUT_SECONDS", "300"))
+BROWSER_WIDTH = int(os.environ.get("BROWSER_WIDTH", "1024"))
+BROWSER_HEIGHT = int(os.environ.get("BROWSER_HEIGHT", "768"))
+NAVIGATION_POLL_INTERVAL_SECONDS = 0.1
 
 
 def parse_integer(name: str, value: str | None, default: int, minimum: int, maximum: int) -> int:
@@ -72,6 +79,81 @@ class PageUnavailableError(Exception):
     """The target page could not be opened by Chromium."""
 
 
+def apply_viewport(driver: webdriver.Chrome, width: int, height: int, verify: bool = False) -> None:
+    """Apply the requested CSS viewport and optionally verify it on the loaded page."""
+    metrics = {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}
+    driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", metrics)
+    if not verify:
+        return
+
+    # Let responsive layout and media queries settle before reading the viewport.
+    driver.execute_async_script(
+        "const done = arguments[arguments.length - 1]; "
+        "requestAnimationFrame(() => requestAnimationFrame(done));"
+    )
+    actual = driver.execute_script("return [window.innerWidth, window.innerHeight]")
+    if actual != [width, height]:
+        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", metrics)
+        driver.execute_async_script(
+            "const done = arguments[arguments.length - 1]; "
+            "requestAnimationFrame(() => requestAnimationFrame(done));"
+        )
+        actual = driver.execute_script("return [window.innerWidth, window.innerHeight]")
+    if actual != [width, height]:
+        raise WebDriverException(
+            f"Failed to set viewport to {width}x{height}; browser reported {actual}"
+        )
+
+
+def wait_for_final_document(
+    driver: webdriver.Chrome,
+    quiet_period_ms: int,
+    navigation_timeout_ms: int,
+    poll_interval_seconds: float = NAVIGATION_POLL_INTERVAL_SECONDS,
+) -> tuple[str, int]:
+    """Wait until the URL and document state remain stable for the quiet period."""
+    deadline = time.monotonic() + navigation_timeout_ms / 1000
+    last_url = driver.current_url
+    stable_since = time.monotonic()
+    redirect_count = 0
+
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            raise TimeoutException("Timed out while waiting for redirects to finish")
+
+        try:
+            current_url = driver.current_url
+            ready_state = driver.execute_script("return document.readyState")
+        except WebDriverException:
+            # JavaScript execution can briefly fail while Chromium replaces the
+            # execution context during a client-side navigation.
+            stable_since = now
+        else:
+            if current_url != last_url:
+                redirect_count += 1
+                last_url = current_url
+                stable_since = now
+            if ready_state not in {"interactive", "complete"}:
+                stable_since = now
+            elif (now - stable_since) * 1000 >= quiet_period_ms:
+                return current_url, redirect_count
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutException("Timed out while waiting for redirects to finish")
+        time.sleep(min(poll_interval_seconds, remaining))
+
+
+def resize_png(png: bytes, width: int, height: int) -> bytes:
+    """Resize an already captured PNG without changing the browser viewport."""
+    with Image.open(BytesIO(png)) as source:
+        resized = source.resize((width, height), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        resized.save(output, format="PNG")
+    return output.getvalue()
+
+
 def create_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.binary_location = os.environ.get("CHROMIUM_EXECUTABLE_PATH", "/usr/bin/chromium")
@@ -80,6 +162,7 @@ def create_driver() -> webdriver.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument(f"--window-size={BROWSER_WIDTH},{BROWSER_HEIGHT}")
     service = Service(executable_path=os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver"))
     return webdriver.Chrome(service=service, options=options)
 
@@ -93,38 +176,70 @@ def capture_screenshot(
     navigation_timeout_ms: int,
     user_agent: str,
     full_page: bool,
+    redirect_wait_ms: int = REDIRECT_WAIT_MS,
 ) -> bytes:
+    started_at = time.monotonic()
     driver.set_page_load_timeout(navigation_timeout_ms / 1000)
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": user_agent})
     driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
     driver.execute_cdp_cmd("Network.clearBrowserCache", {})
-    driver.execute_cdp_cmd(
-        "Emulation.setDeviceMetricsOverride",
-        {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False},
-    )
+    # Navigate and render with a normal desktop viewport. width/height control
+    # only the final PNG size and never change the target page layout.
+    apply_viewport(driver, BROWSER_WIDTH, BROWSER_HEIGHT)
     try:
         driver.get(url)
     except TimeoutException:
         raise
     except WebDriverException as error:
         raise PageUnavailableError("Target site is unavailable") from error
+
+    elapsed_ms = round((time.monotonic() - started_at) * 1000)
+    remaining_navigation_ms = navigation_timeout_ms - elapsed_ms
+    if remaining_navigation_ms <= 0:
+        raise TimeoutException("Timed out while waiting for redirects to finish")
+    final_url, redirect_count = wait_for_final_document(
+        driver,
+        quiet_period_ms=redirect_wait_ms,
+        navigation_timeout_ms=remaining_navigation_ms,
+    )
+    apply_viewport(driver, BROWSER_WIDTH, BROWSER_HEIGHT, verify=True)
     if delay_ms:
         time.sleep(delay_ms / 1000)
 
-    capture_height = height
+    capture_height = BROWSER_HEIGHT
     if full_page:
         metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
-        capture_height = math.ceil(max(height, metrics["cssContentSize"]["height"]))
+        capture_height = math.ceil(max(BROWSER_HEIGHT, metrics["cssContentSize"]["height"]))
     result = driver.execute_cdp_cmd(
         "Page.captureScreenshot",
         {
             "format": "png",
             "fromSurface": True,
             "captureBeyondViewport": full_page,
-            "clip": {"x": 0, "y": 0, "width": width, "height": capture_height, "scale": 1},
+            "clip": {
+                "x": 0,
+                "y": 0,
+                "width": BROWSER_WIDTH,
+                "height": capture_height,
+                "scale": 1,
+            },
         },
     )
-    return base64.b64decode(result["data"])
+    logger.info(
+        "Screenshot captured initial_host=%s final_host=%s redirects=%d "
+        "source_width=%d source_height=%d output_width=%d output_height=%d "
+        "full_page=%s duration_ms=%d",
+        urlsplit(url).hostname,
+        urlsplit(final_url).hostname,
+        redirect_count,
+        BROWSER_WIDTH,
+        capture_height,
+        width,
+        height,
+        full_page,
+        round((time.monotonic() - started_at) * 1000),
+    )
+    return resize_png(base64.b64decode(result["data"]), width, height)
 
 
 @dataclass
@@ -236,6 +351,9 @@ def take_screenshot(request: Request) -> Response:
         timeout_ms = parse_integer(
             "timeout_ms", params.get("timeout_ms"), NAVIGATION_TIMEOUT_MS, 1, MAX_NAVIGATION_TIMEOUT_MS
         )
+        redirect_wait_ms = parse_integer(
+            "redirect_wait_ms", params.get("redirect_wait_ms"), REDIRECT_WAIT_MS, 0, MAX_REDIRECT_WAIT_MS
+        )
         full_page = parse_bool(params.get("full_page"))
         user_agent = params.get("user_agent") or DEFAULT_USER_AGENT
     except ValueError as error:
@@ -250,6 +368,7 @@ def take_screenshot(request: Request) -> Response:
             navigation_timeout_ms=timeout_ms,
             user_agent=user_agent,
             full_page=full_page,
+            redirect_wait_ms=redirect_wait_ms,
         )
     except RuntimeError as error:
         return PlainTextResponse(str(error), status_code=503)

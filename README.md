@@ -48,14 +48,17 @@ The container includes Chromium and the matching ChromeDriver package. Selenium 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `url` | required | HTTP or HTTPS page URL |
-| `width` | `400` | viewport and PNG width, 1–10000 px |
-| `height` | `300` | viewport and normal PNG height, 1–10000 px |
-| `full_page` | `false` | capture the full page height (`true`/`false`) |
-| `delay_ms` | `1000` | wait after DOMContentLoaded, 0–60000 ms |
-| `timeout_ms` | `30000` | page navigation timeout, 1–120000 ms |
+| `width` | `400` | output PNG width, 1–10000 px |
+| `height` | `300` | output PNG height, 1–10000 px |
+| `full_page` | `false` | capture the full page before resizing (`true`/`false`) |
+| `delay_ms` | `1000` | wait on the final page before capture, 0–60000 ms |
+| `redirect_wait_ms` | `3000` | quiet period used to detect client-side redirects, 0–60000 ms |
+| `timeout_ms` | `30000` | total initial navigation and redirect-chain timeout, 1–120000 ms |
 | `user_agent` | Chrome-like desktop UA | browser User-Agent |
 
-Successful responses have `Content-Type: image/png`. Errors return plain text: `400` for invalid parameters, `502` when the target site cannot be opened, `503` when the queue is full, `504` for page load timeout, and `500` for browser failures. `full_page=true` uses the requested `height` as the viewport height and captures at least that much of the page. `timeout_ms` limits page navigation only; time in the queue, browser startup, and `delay_ms` are additional.
+Successful responses have `Content-Type: image/png`. Errors return plain text: `400` for invalid parameters, `502` when the target site cannot be opened, `503` when the queue is full, `504` for page load or redirect timeout, and `500` for browser failures. The returned PNG always has the requested `width` and `height`.
+
+Chromium follows HTTP redirects itself. The service also watches for JavaScript and meta-refresh navigation until the URL and document state stay stable for `redirect_wait_ms`; the quiet period restarts after every detected navigation. Navigation and capture use the configured desktop viewport (`BROWSER_WIDTH` × `BROWSER_HEIGHT`, 1024 × 768 by default). The target page never sees the requested output dimensions. After capture, Pillow resizes the resulting PNG to the requested `width` and `height`. With `full_page=true`, the complete page is captured at the configured browser width and then resized to the exact output dimensions. Set `redirect_wait_ms=0` only for pages that are known not to redirect after loading.
 
 ```bash
 curl -G 'http://localhost:5000/screenshot' \
@@ -88,7 +91,10 @@ The current `screenshoter.py` uses `https://mini.s-shot.ru/?<page URL>`; that re
 | --- | --- | --- |
 | `MAX_QUEUE_SIZE` | `100` | maximum number of waiting requests; further requests get `503` |
 | `BROWSER_IDLE_TIMEOUT_SECONDS` | `300` | seconds before closing an idle browser; `0` keeps it open |
+| `BROWSER_WIDTH` | `1024` | browser viewport width used during navigation and redirects |
+| `BROWSER_HEIGHT` | `768` | browser viewport height used during navigation and redirects |
 | `NAVIGATION_TIMEOUT_MS` | `30000` | Selenium page load timeout |
+| `REDIRECT_WAIT_MS` | `3000` | default quiet period for client-side redirects |
 | `CHROMIUM_EXECUTABLE_PATH` | `/usr/bin/chromium-browser` in Docker | browser binary |
 | `CHROMEDRIVER_PATH` | `/usr/bin/chromedriver` | driver binary |
 
